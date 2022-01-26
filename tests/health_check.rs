@@ -1,26 +1,61 @@
 use std::net::TcpListener;
 
-use sqlx::{Connection, PgConnection};
-use zero2prod::configuration::get_configuration;
+use sqlx::{Connection, Executor, PgConnection, PgPool};
+use uuid::Uuid;
+use zero2prod::configuration::{get_configuration, DatabaseSettings};
 
-fn spawn_app() -> String {
-    let listerner = TcpListener::bind("127.0.0.1:0").unwrap();
+pub struct TestApp {
+    pub address: String,
+    pub db_pool: PgPool,
+}
+
+async fn spawn_app() -> TestApp {
+    let listerner = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to random port");
     let port = listerner.local_addr().unwrap().port();
-    let server = zero2prod::startup::run(listerner).expect("Failed to spawn server app");
+    let address = format!("http://127.0.0.1:{}", port);
 
+    let mut configuration = get_configuration().expect("Failed to read configuration");
+    configuration.database.database_name = Uuid::new_v4().to_string();
+
+    let db_pool = configure_database(&configuration.database).await;
+
+    let server =
+        zero2prod::startup::run(listerner, db_pool.clone()).expect("Failed to spawn server app");
     let _ = actix_web::rt::spawn(server);
 
-    format!("http://127.0.0.1:{}", port)
+    TestApp { address, db_pool }
+}
+
+async fn configure_database(config: &DatabaseSettings) -> PgPool {
+    let mut connection = PgConnection::connect(&config.connection_string_without_db())
+        .await
+        .expect("Failed to connect to Postgres");
+
+    connection
+        .execute(format!(r#"CREATE DATABASE "{}";"#, config.database_name).as_str())
+        .await
+        .expect("Failed to create database.");
+
+    let db_pool = PgPool::connect(&config.connection_string())
+        .await
+        .expect("Failed to connect to Postgres");
+
+    sqlx::migrate!("./migrations")
+        .run(&db_pool)
+        .await
+        .expect("Failed to migrate the database");
+
+    db_pool
 }
 
 #[actix_web::test]
 async fn health_check_works() {
-    let addr = spawn_app();
+    let app = spawn_app().await;
 
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/health_check", addr))
+        .get(format!("{}/health_check", app.address))
         .send()
         .await
         .expect("Failed to execute request.");
@@ -31,19 +66,13 @@ async fn health_check_works() {
 
 #[actix_web::test]
 async fn subscribe_returns_a_200_for_valid_form_data() {
-    let addr = spawn_app();
-    let configuration = get_configuration().expect("Failed to read configuration");
-    let connection_string = configuration.database.connection_string();
-
-    let mut connection = PgConnection::connect(&connection_string)
-        .await
-        .expect("Failed to connect to Postgres.");
+    let app = spawn_app().await;
 
     let client = reqwest::Client::new();
 
     let body = "name=le%20guin&email=ursula_le_guin%40gmail.com";
     let response = client
-        .post(format!("{}/subscriptions", addr))
+        .post(format!("{}/subscriptions", app.address))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
@@ -53,7 +82,7 @@ async fn subscribe_returns_a_200_for_valid_form_data() {
     assert_eq!(200, response.status().as_u16());
 
     let saved = sqlx::query!("SELECT email, name from subscriptions")
-        .fetch_one(&mut connection)
+        .fetch_one(&app.db_pool)
         .await
         .expect("Failed to fetch saved subscriptions");
 
@@ -63,7 +92,7 @@ async fn subscribe_returns_a_200_for_valid_form_data() {
 
 #[actix_web::test]
 async fn subscribe_returns_a_400_when_data_is_missing() {
-    let addr = spawn_app();
+    let app = spawn_app().await;
 
     let client = reqwest::Client::new();
 
@@ -75,7 +104,7 @@ async fn subscribe_returns_a_400_when_data_is_missing() {
 
     for (body, error_message) in test_cases {
         let response = client
-            .post(format!("{}/subscriptions", addr))
+            .post(format!("{}/subscriptions", app.address))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(body)
             .send()
