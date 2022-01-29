@@ -2,4 +2,4 @@ application:
   host: "0.0.0.0"
 
 database:
-  ssl_mode: true
+  require_ssl: true
