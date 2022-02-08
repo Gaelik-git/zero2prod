@@ -54,7 +54,11 @@ impl EmailClient {
             )
             .send()
             .await?
-            .error_for_status()?;
+            .error_for_status()
+            .map_err(|e| {
+                tracing::error!("Failed to send email to Postmark : {:?}", e);
+                e
+            })?;
 
         Ok(())
     }
