@@ -1,6 +1,8 @@
-use actix_web::{web, HttpResponse, Responder};
+use actix_web::{web, HttpResponse, ResponseError};
+use anyhow::Context;
 use chrono::Utc;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use reqwest::StatusCode;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -9,6 +11,42 @@ use crate::{
     email_client::EmailClient,
     startup::ApplicationBaseUrl,
 };
+
+#[derive(thiserror::Error)]
+pub enum SubscribeError {
+    #[error("{0}")]
+    ValidationError(String),
+    #[error(transparent)]
+    UnexpectedError(#[from] anyhow::Error),
+}
+
+impl std::fmt::Debug for SubscribeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        error_chain_fmt(self, f)
+    }
+}
+
+impl ResponseError for SubscribeError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            SubscribeError::ValidationError(_) => StatusCode::BAD_REQUEST,
+            SubscribeError::UnexpectedError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+pub fn error_chain_fmt(
+    e: &impl std::error::Error,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    writeln!(f, "{}\n", e)?;
+    let mut current = e.source();
+    while let Some(cause) = current {
+        writeln!(f, "Caused by:\n\t{}", cause)?;
+        current = cause.source();
+    }
+    Ok(())
+}
 
 #[derive(serde::Deserialize)]
 pub struct FormData {
@@ -39,48 +77,35 @@ pub async fn subscribe(
     pool: web::Data<PgPool>,
     email_client: web::Data<EmailClient>,
     base_url: web::Data<ApplicationBaseUrl>,
-) -> impl Responder {
-    let new_subscriber = match form.0.try_into() {
-        Ok(s) => s,
-        Err(_) => return HttpResponse::BadRequest(),
-    };
-
-    let mut transaction = match pool.begin().await {
-        Ok(transaction) => transaction,
-        Err(_) => return HttpResponse::InternalServerError(),
-    };
-
-    let subscriber_id = match insert_subscriber(&mut transaction, &new_subscriber).await {
-        Ok(uuid) => uuid,
-        Err(_) => return HttpResponse::InternalServerError(),
-    };
-
-    let subscription_token = generate_subscription_token();
-
-    if store_token(&mut transaction, subscriber_id, &subscription_token)
+) -> Result<HttpResponse, SubscribeError> {
+    let new_subscriber = form.0.try_into().map_err(SubscribeError::ValidationError)?;
+    let mut transaction = pool
+        .begin()
         .await
-        .is_err()
-    {
-        return HttpResponse::InternalServerError();
-    }
+        .context("Failed to acquire a Postgres connection from the pool")?;
+    let subscriber_id = insert_subscriber(&mut transaction, &new_subscriber)
+        .await
+        .context("Failed to insert new subscriber in db")?;
+    let subscription_token = generate_subscription_token();
+    store_token(&mut transaction, subscriber_id, &subscription_token)
+        .await
+        .context("Failed to store comfirmation token")?;
 
-    if transaction.commit().await.is_err() {
-        return HttpResponse::InternalServerError();
-    }
+    transaction
+        .commit()
+        .await
+        .context("Failed to commit transaction in db")?;
 
-    if send_confirmation_email(
+    send_confirmation_email(
         &email_client,
         new_subscriber,
         &base_url.0,
         &subscription_token,
     )
     .await
-    .is_err()
-    {
-        return HttpResponse::InternalServerError();
-    }
+    .context("Send confirmation email")?;
 
-    HttpResponse::Ok()
+    Ok(HttpResponse::Ok().finish())
 }
 
 #[tracing::instrument(
@@ -99,11 +124,7 @@ pub async fn store_token(
         subscriber_id
     )
     .execute(transaction)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to execute query: {:?}", e);
-        e
-    })?;
+    .await?;
     Ok(())
 }
 
@@ -163,10 +184,6 @@ pub async fn insert_subscriber(
         Utc::now()
     )
     .execute(transaction)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to execute query: {:?}", e);
-        e
-    })?;
+    .await?;
     Ok(subscriber_id)
 }
